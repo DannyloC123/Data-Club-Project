@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, pipeline
 import torch
 import torch.nn.functional as F
 import pandas as pd
@@ -19,6 +19,11 @@ nltk.download('punkt')
 
 if not os.path.exists(file_path):
     raise FileNotFoundError(f"File not found.\nChecked path: {file_path}")
+
+sentiment_model = pipeline(
+    "sentiment-analysis",
+    model="distilbert-base-uncased-finetuned-sst-2-english"
+)
 
 pg_dataframe = pd.read_excel(file_path)
 
@@ -45,6 +50,44 @@ pg_subset["label"] = pg_subset["review_rating"].apply(
 
 # Remove neutral reviews (rating = 3)
 pg_subset = pg_subset.dropna(subset=["label"])
+
+
+# -----------------------------
+# 🔹 GENERATE SENTIMENT PREDICTIONS
+# -----------------------------
+sentiment_sample = pg_subset.sample(n=1000, random_state=42)
+
+clean_texts = [
+    str(x) for x in sentiment_sample["review_text"].fillna("")
+]
+
+preds = sentiment_model(
+    clean_texts,
+    batch_size=32,
+    truncation=True,
+    max_length=512
+)
+
+sentiment_sample["predicted_label"] = [
+    1 if p["label"] == "POSITIVE" else 0
+    for p in preds
+]
+
+from sklearn.metrics import accuracy_score, classification_report
+
+# Compare ONLY on the sampled data
+acc = accuracy_score(
+    sentiment_sample["label"],
+    sentiment_sample["predicted_label"]
+)
+
+print(f"\n🎯 Sentiment Accuracy: {acc:.4f}")
+
+print("\n📊 Classification Report:")
+print(classification_report(
+    sentiment_sample["label"],
+    sentiment_sample["predicted_label"]
+))
 
 
 # Use product descriptions (you can switch to review_text if needed)
@@ -118,6 +161,42 @@ from sklearn.cluster import KMeans
 
 kmeans = KMeans(n_clusters=10, random_state=42)
 pg_subset["cluster"] = kmeans.fit_predict(sentence_embeddings.cpu().numpy())
+
+
+# -----------------------------
+# 🔹 CLUSTER QUALITY (SILHOUETTE SCORE)
+# -----------------------------
+from sklearn.metrics import silhouette_score
+
+sil_score = silhouette_score(
+    sentence_embeddings.cpu().numpy(),
+    pg_subset["cluster"]
+)
+
+print(f"\n📐 Silhouette Score: {sil_score:.4f}")
+
+
+# -----------------------------
+# 🔹 CLUSTER → SENTIMENT ALIGNMENT (ACCURACY)
+# -----------------------------
+from sklearn.metrics import accuracy_score
+
+# Majority sentiment per cluster
+cluster_to_label = (
+    pg_subset.groupby("cluster")["label"]
+    .mean()
+    .round()
+)
+
+# Predict sentiment from cluster
+pred_from_cluster = pg_subset["cluster"].map(cluster_to_label)
+
+# Compare to actual sentiment
+cluster_acc = accuracy_score(pg_subset["label"], pred_from_cluster)
+
+print(f"\n📊 Cluster-based Accuracy: {cluster_acc:.4f}")
+
+
 
 # -----------------------------
 # 🔹 CLUSTER → RATING ANALYSIS
