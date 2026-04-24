@@ -1,25 +1,103 @@
-from transformers import AutoTokenizer, AutoModel, pipeline
+# ── IMPORTS ───────────────────────────────────────────────────────────────────
+import os
+import pickle
+
+import nltk
+import pandas as pd
 import torch
 import torch.nn.functional as F
-import pandas as pd
-import os
-import nltk
+from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
+from sklearn.metrics import accuracy_score, classification_report, silhouette_score
+from transformers import AutoTokenizer, AutoModel, pipeline
 # import hdbscan
 
 
-# -----------------------------
-# 🔹 LOAD DATA
-# -----------------------------
+# ── GLOBAL VARIABLES & CONFIGURATION ─────────────────────────────────────────
 
+# Path to the input data file
 file_path = 'Review_Data.xlsx'
+
+# When True, limits processing to a smaller sample for faster iteration during development
 DEV_MODE = True
 
+# Number of reviews to embed/cluster at once; larger = faster but more memory
+batch_size = 64
+
+# Words to strip from TF-IDF keywords that are brand names, product categories,
+# or other terms that don't describe a product attribute
+custom_stopwords = {
+    "cascade", "tide", "gain", "downy", "dawn",
+    "febreze", "swiffer", "bounce", "platinum",
+    "magic",
+    "dishwasher", "dishes", "laundry", "detergent",
+    "pods", "clothes", "fabric", "softener",
+    "soap", "cleaner", "washing",
+    "food", "item", "product", "brand", "pack", "bottle"
+}
+
+# Generic sentiment words we don't want surfaced as cluster keywords
+bad_words = {
+    "good", "great", "best", "nice", "bad", "poor",
+    "excellent", "perfect", "amazing",
+    "love", "loves", "liked", "like",
+    "works", "working", "use", "used"
+}
+
+
+# ── FUNCTIONS ─────────────────────────────────────────────────────────────────
+
+def mean_pooling(model_output, attention_mask):
+    """
+    Converts per-token embeddings into a single sentence embedding by averaging
+    all token vectors, weighted so that padding tokens don't contribute.
+    """
+    token_embeddings = model_output.last_hidden_state
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+
+def dedupe_keywords(keywords):
+    """
+    Removes near-duplicate keywords (e.g. 'clean' and 'cleans') by comparing
+    word stems. Keeps the first occurrence and drops later variants.
+    """
+    seen = set()
+    result = []
+    for w in keywords:
+        root = w.rstrip('s')  # simple normalization
+        if root not in seen:
+            seen.add(root)
+            result.append(w)
+    return result
+
+
+def keep_descriptive_words(words):
+    """
+    Filters a word list down to adjectives (JJ*) and nouns (NN*) using POS tagging,
+    then removes any generic sentiment words that don't describe product attributes.
+    """
+    tagged = nltk.pos_tag(words)
+
+    return [
+        word for word, tag in tagged
+        if (
+            (tag.startswith("JJ") or tag.startswith("NN"))
+            and word.lower() not in bad_words
+        )
+    ]
+
+
+# ── SETUP: DATA & MODELS ──────────────────────────────────────────────────────
+
+# Download NLTK data needed for POS tagging used in keyword extraction
 nltk.download('averaged_perceptron_tagger_eng')
 nltk.download('punkt')
 
 if not os.path.exists(file_path):
     raise FileNotFoundError(f"File not found.\nChecked path: {file_path}")
 
+# Pre-trained DistilBERT model fine-tuned on SST-2 for positive/negative classification
 sentiment_model = pipeline(
     "sentiment-analysis",
     model="distilbert-base-uncased-finetuned-sst-2-english"
@@ -27,34 +105,34 @@ sentiment_model = pipeline(
 
 pg_dataframe = pd.read_excel(file_path)
 
-# -----------------------------
-# 🔹 SETTINGS
-# -----------------------------
 
+# ── SETTINGS ──────────────────────────────────────────────────────────────────
+
+# In dev mode we cap the sample size to avoid waiting on the full dataset
 if DEV_MODE:
     num_samples = 3000
 else:
     num_samples = len(pg_dataframe)
+
 #pg_subset = pg_dataframe.sample(n=num_samples, random_state=42).copy()
 #num_samples = len(pg_dataframe)  # change this to control how many descriptions you use
 pg_subset = pg_dataframe.copy()
-batch_size = 64
 
 
-# -----------------------------
-# 🔹 DEFINE HIGH VS LOW REVIEWS (GROUND TRUTH)
-# -----------------------------
+# ── GROUND-TRUTH LABELS ───────────────────────────────────────────────────────
+
+# Ratings ≥ 4 are "positive" (1), ratings ≤ 2 are "negative" (0).
+# Rating 3 is ambiguous, so we drop those rows entirely.
 pg_subset["label"] = pg_subset["review_rating"].apply(
     lambda x: 1 if x >= 4 else (0 if x <= 2 else None)
 )
 
-# Remove neutral reviews (rating = 3)
 pg_subset = pg_subset.dropna(subset=["label"])
 
 
-# -----------------------------
-# 🔹 GENERATE SENTIMENT PREDICTIONS
-# -----------------------------
+# ── SENTIMENT MODEL EVALUATION ────────────────────────────────────────────────
+
+# Run the sentiment model on a random 1 000-review sample so evaluation is fast
 sentiment_sample = pg_subset.sample(n=1000, random_state=42)
 
 clean_texts = [
@@ -68,14 +146,12 @@ preds = sentiment_model(
     max_length=512
 )
 
+# Map the model's string label back to our 0/1 scheme
 sentiment_sample["predicted_label"] = [
     1 if p["label"] == "POSITIVE" else 0
     for p in preds
 ]
 
-from sklearn.metrics import accuracy_score, classification_report
-
-# Compare ONLY on the sampled data
 acc = accuracy_score(
     sentiment_sample["label"],
     sentiment_sample["predicted_label"]
@@ -90,32 +166,21 @@ print(classification_report(
 ))
 
 
-# Use product descriptions (you can switch to review_text if needed)
+# ── SENTENCE EMBEDDINGS ───────────────────────────────────────────────────────
+
+# We embed review_text so that semantically similar reviews end up close
+# together in vector space, enabling meaningful clustering.
 sentences = pg_subset["review_text"].fillna("").astype(str).tolist()
 
-
-# -----------------------------
-# 🔹 MEAN POOLING FUNCTION
-# -----------------------------
-def mean_pooling(model_output, attention_mask):
-    token_embeddings = model_output.last_hidden_state
-    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-
-
-# -----------------------------
-# 🔹 LOAD MODEL
-# -----------------------------
+# all-MiniLM-L6-v2 is a lightweight sentence-transformer that balances
+# speed and quality for sentence-level semantic similarity tasks.
 tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
 model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
 model.eval()
 
-
-# -----------------------------
-# 🔹 GENERATE EMBEDDINGS (BATCHED)
-# -----------------------------
 all_embeddings = []
 
+# Reuse saved embeddings to avoid re-running the expensive forward pass each time
 if os.path.exists("embeddings.pt"):
     print("Loading cached embeddings...")
     sentence_embeddings = torch.load("embeddings.pt")
@@ -143,31 +208,22 @@ else:
 
         print(f"Processed {i + len(batch)} / {len(sentences)}", flush=True)
 
-    # -----------------------------
-    # 🔹 COMBINE + SAVE (ONLY HERE)
-    # -----------------------------
+    # Concatenate all batch tensors into one matrix, then cache to disk
     sentence_embeddings = torch.cat(all_embeddings, dim=0)
     torch.save(sentence_embeddings, "embeddings.pt")
 
     print("Embeddings saved.")
 
 
+# ── CLUSTERING ────────────────────────────────────────────────────────────────
 
-
-# -----------------------------
-# 🔹 OPTIONAL: CLUSTERING
-# -----------------------------
-from sklearn.cluster import KMeans
-
+# K-Means groups reviews into 10 clusters based on embedding similarity.
+# Each cluster ideally represents a coherent theme or product attribute.
 kmeans = KMeans(n_clusters=10, random_state=42)
 pg_subset["cluster"] = kmeans.fit_predict(sentence_embeddings.cpu().numpy())
 
-
-# -----------------------------
-# 🔹 CLUSTER QUALITY (SILHOUETTE SCORE)
-# -----------------------------
-from sklearn.metrics import silhouette_score
-
+# Silhouette score measures how well-separated the clusters are (-1 to 1;
+# higher is better, >0.2 is generally considered meaningful).
 sil_score = silhouette_score(
     sentence_embeddings.cpu().numpy(),
     pg_subset["cluster"]
@@ -176,79 +232,47 @@ sil_score = silhouette_score(
 print(f"\n📐 Silhouette Score: {sil_score:.4f}")
 
 
-# -----------------------------
-# 🔹 CLUSTER → SENTIMENT ALIGNMENT (ACCURACY)
-# -----------------------------
-from sklearn.metrics import accuracy_score
+# ── CLUSTER → SENTIMENT ACCURACY ─────────────────────────────────────────────
 
-# Majority sentiment per cluster
+# Assign each cluster the majority sentiment label from its members,
+# then measure how well that majority label predicts individual reviews.
 cluster_to_label = (
     pg_subset.groupby("cluster")["label"]
     .mean()
     .round()
 )
 
-# Predict sentiment from cluster
 pred_from_cluster = pg_subset["cluster"].map(cluster_to_label)
 
-# Compare to actual sentiment
 cluster_acc = accuracy_score(pg_subset["label"], pred_from_cluster)
 
 print(f"\n📊 Cluster-based Accuracy: {cluster_acc:.4f}")
 
 
-
-# -----------------------------
-# 🔹 CLUSTER → RATING ANALYSIS
-# -----------------------------
-#print("\nCluster rating analysis:")
+# ── CLUSTER SUMMARY & RANKING ─────────────────────────────────────────────────
 
 cluster_stats = pg_subset.groupby("cluster")["review_rating"].agg(["mean", "count"])
-#print(cluster_stats)
 
-
-
-# -----------------------------
-# 🔹 CLUSTER → RANKING
-# -----------------------------
+# Rank clusters from most positive to least, using positive_rate as the primary
+# sort key and avg_rating as a tiebreaker.
 cluster_summary = pg_subset.groupby("cluster").agg(
     avg_rating=("review_rating", "mean"),
     positive_rate=("label", "mean"),
     size=("cluster", "count")
 ).reset_index()
 
-# Sort clusters (best → worst)
 cluster_summary = cluster_summary.sort_values(
     by=["positive_rate", "avg_rating"],
     ascending=False
 )
 
-# Add rank column
 cluster_summary["rank"] = range(1, len(cluster_summary) + 1)
 
-#print("\nCluster Ranking:")
-#print(cluster_summary)
 
-# -----------------------------
-# 🔹 CLUSTER → AUTO KEYWORDS (IMPROVED)
-# -----------------------------
-from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
+# ── TF-IDF KEYWORD EXTRACTION ─────────────────────────────────────────────────
 
-custom_stopwords = {
-    # 🔹 BRAND / PRODUCT NAMES
-    "cascade", "tide", "gain", "downy", "dawn",
-    "febreze", "swiffer", "bounce", "platinum",
-    "magic",
-
-    # 🔹 GENERIC PRODUCT CATEGORY WORDS (non-attributes)
-    "dishwasher", "dishes", "laundry", "detergent",
-    "pods", "clothes", "fabric", "softener",
-    "soap", "cleaner", "washing",
-
-    # 🔹 REDUNDANT / NON-ATTRIBUTE TERMS
-    "food", "item", "product", "brand", "pack", "bottle"
-}
-
+# TF-IDF surfaces words that are common within a cluster but rare across
+# all clusters — these become the descriptive keywords / theme labels.
 all_stopwords = list(ENGLISH_STOP_WORDS.union(custom_stopwords))
 
 tfidf = TfidfVectorizer(
@@ -258,11 +282,7 @@ tfidf = TfidfVectorizer(
     max_df=0.8
 )
 
-# -----------------------------
-# 🔹 LOAD / GENERATE TF-IDF
-# -----------------------------
-import pickle
-
+# Reuse cached TF-IDF to avoid refitting on every run
 if os.path.exists("tfidf.pkl") and os.path.exists("tfidf_matrix.pkl"):
     print("Loading cached TF-IDF...")
 
@@ -287,11 +307,8 @@ else:
 
 terms = tfidf.get_feature_names_out()
 
-# -----------------------------
-# 🔹 PRECOMPUTE CLUSTER TF-IDF MEANS
-# -----------------------------
+# Pre-compute the mean TF-IDF vector for each cluster so we only do this once
 cluster_means = {}
-
 cluster_ids = pg_subset["cluster"].values
 
 for c in cluster_summary["cluster"]:
@@ -299,43 +316,16 @@ for c in cluster_summary["cluster"]:
     cluster_means[c] = tfidf_matrix[mask].mean(axis=0).A1
 
 
-#print("\n🔍 CLUSTER THEMES:\n")
-
-
 # clusterer = hdbscan.HDBSCAN(min_cluster_size=100)
 # pg_subset["cluster"] = clusterer.fit_predict(sentence_embeddings.cpu().numpy())
 
 
-# -----------------------------
-# 🔹 BUILD CLUSTER SUMMARY TABLE
-# -----------------------------
+# ── CLUSTER LABEL GENERATION ──────────────────────────────────────────────────
+
+# For each cluster: grab top TF-IDF terms → filter noise → keep adjectives/nouns
+# → dedupe → join into a short human-readable label (e.g. "clean / fresh / scent").
 cluster_table = cluster_summary.copy()
-
-
-# -----------------------------
-# 🔹 ADD LABELS (FIXED)
-# -----------------------------
 labels = {}
-
-# -----------------------------
-# 🔹 DEDUPE KEYWORDS
-# -----------------------------
-def dedupe_keywords(keywords):
-    seen = set()
-    result = []
-    for w in keywords:
-        root = w.rstrip('s')  # simple normalization
-        if root not in seen:
-            seen.add(root)
-            result.append(w)
-    return result
-
-def keep_descriptive_words(words):
-    tagged = nltk.pos_tag(words)
-    return [
-        word for word, tag in tagged
-        if tag.startswith("JJ")  # adjectives only
-    ]
 
 for c in cluster_summary["cluster"]:
     mean_tfidf = cluster_means[c]
@@ -343,55 +333,79 @@ for c in cluster_summary["cluster"]:
 
     keywords = [terms[i] for i in top_indices]
 
-    # filter junk words
     filtered_keywords = [
         w for w in keywords
-        if w not in custom_stopwords and len(w) > 3
+        if (
+            w not in custom_stopwords
+            and w.lower() not in bad_words
+            and len(w) > 3
+        )
     ]
 
-    # 🔥 KEEP ONLY ATTRIBUTES (adjectives)
     descriptive = keep_descriptive_words(filtered_keywords)
 
-    # dedupe after filtering
     deduped = dedupe_keywords(descriptive)
 
-    # fallback if empty
+    # If filtering removed everything, fall back to the raw filtered list
     if len(deduped) == 0:
         deduped = filtered_keywords[:3]
 
     if len(deduped) >= 2:
         labels[c] = " / ".join(deduped[:3])
     else:
-        # fallback: mix in other filtered words
-        fallback = dedupe_keywords(filtered_keywords)
-        labels[c] = " / ".join(fallback[:3])
+        fallback = dedupe_keywords([
+            w for w in filtered_keywords
+            if w not in {
+                "good", "great", "best", "nice", "bad", "poor",
+                "excellent", "perfect", "amazing",
+                "love", "loves", "liked", "like",
+                "works", "working", "use", "used"
+            }
+        ])
+
+        if len(fallback) >= 2:
+            labels[c] = " / ".join(fallback[:3])
+        elif len(filtered_keywords) >= 2:
+            labels[c] = " / ".join(filtered_keywords[:2])  # last resort
+        else:
+            labels[c] = filtered_keywords[0] if filtered_keywords else "other"
 
 
-# map labels to table
-cluster_table["label"] = cluster_table["cluster"].map(labels)
+# Attach human-readable labels back to the summary table, then sort by rank
+cluster_summary["label"] = cluster_summary["cluster"].map(labels)
 
-# Optional: sort by rank or size
 cluster_table = cluster_table.sort_values(by="rank")
 
 print("\n📊 CLUSTER SUMMARY TABLE:\n")
 print(cluster_table)
 
 
-# -----------------------------
-# 🔹 VIEW RESULTS
-# -----------------------------
-#print("\nCluster breakdown:")
-#print(pg_subset.groupby("cluster").size())
-'''
-for c in cluster_summary["cluster"]:
-    print(f"\nCluster {c} examples:")
-    print(pg_subset[pg_subset["cluster"] == c]["review_text"].head(3))
-'''
+# ── NEGATIVE CLUSTER ANALYSIS ─────────────────────────────────────────────────
+
+# Separate positive and negative reviews so we can inspect which clusters
+# are driving the most negative feedback.
+positive_df = pg_subset[pg_subset["label"] == 1]
+negative_df = pg_subset[pg_subset["label"] == 0]
+
+neg_cluster_summary = negative_df.groupby("cluster").agg(
+    avg_rating=("review_rating", "mean"),
+    size=("cluster", "count")
+).reset_index()
+
+neg_cluster_summary = neg_cluster_summary.sort_values(
+    by="size", ascending=False
+)
+
+neg_cluster_summary["label"] = neg_cluster_summary["cluster"].map(labels)
+
+print("\n❌ NEGATIVE CLUSTERS WITH LABELS:\n")
+print(neg_cluster_summary[["cluster", "label", "avg_rating", "size"]].head(10))
 
 
-# -----------------------------
-# 🔹 SAVE FILE
-# -----------------------------
+# ── SAVE OUTPUT ───────────────────────────────────────────────────────────────
+
+# Write the final dataframe — now enriched with cluster ID and label — to CSV
+# so results can be explored in Excel or passed to downstream tools.
 pg_subset["cluster_label"] = pg_subset["cluster"].map(labels)
 output_path = 'Subset_with_embeddings.csv'
 pg_subset.to_csv(output_path, index=False)
